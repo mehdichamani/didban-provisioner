@@ -15,6 +15,7 @@ import socket
 import subprocess
 import urllib.request
 import urllib.error
+import ipaddress
 from pathlib import Path
 
 # Cryptography & Packet craft
@@ -52,7 +53,7 @@ ROUTER_HOST = CFG.get("ROUTER_HOST", "router.local")
 ROUTER_USER = CFG.get("ROUTER_USER", "")
 DHCP_SERVER = CFG.get("DHCP_SERVER_NAME", "dhcp1")
 CAMERA_PASSWORD = CFG.get("CAMERA_PASSWORD", "ChangeMe123!")
-IP_START_STR = CFG.get("IP_POOL_START", "172.20.2.188")
+IP_POOL_NAME = CFG.get("IP_POOL_NAME", "")
 
 
 def run_router_cmd(command: str) -> str:
@@ -103,22 +104,49 @@ def scan_unconfigured_cameras(iface: str):
     return cams
 
 
-def get_next_available_ip(start_ip_str: str) -> str:
-    """Queries Mikrotik DHCP leases and returns the next unused IP."""
-    parts = list(map(int, start_ip_str.split(".")))
-    base_prefix = f"{parts[0]}.{parts[1]}.{parts[2]}."
-    start_num = parts[3]
+def get_pool_range(pool_name: str) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]:
+    """Queries Mikrotik for the IP range of the given pool."""
+    if not pool_name:
+        raise ValueError("IP_POOL_NAME is not set in .env. Please specify the pool name.")
 
-    leases_out = run_router_cmd("/ip/dhcp-server/lease/print detail where address~\"172.20.2.\"")
-    used_ips = set(re.findall(r"address=(172\.20\.2\.\d+)", leases_out))
+    print(f"[*] Querying IP pool '{pool_name}' from Mikrotik router...")
+    out = run_router_cmd(f'/ip/pool/print detail where name="{pool_name}"')
+    m = re.search(r"ranges=([0-9.]+)-([0-9.]+)", out)
+    if not m:
+        raise RuntimeError(f"Could not find or parse ranges for pool '{pool_name}' on Mikrotik:\n{out}")
 
-    curr = start_num
-    while curr < 254:
-        candidate = f"{base_prefix}{curr}"
+    start_ip = ipaddress.IPv4Address(m.group(1))
+    end_ip = ipaddress.IPv4Address(m.group(2))
+    return start_ip, end_ip
+
+
+def get_used_ips_from_leases(start_ip: ipaddress.IPv4Address, end_ip: ipaddress.IPv4Address) -> set[ipaddress.IPv4Address]:
+    """Retrieves all allocated lease addresses that fall within the pool range."""
+    leases_out = run_router_cmd("/ip/dhcp-server/lease/print detail")
+    found_ips = re.findall(r"(?:active-address|address)=([0-9.]+)", leases_out)
+    used = set()
+    for ip_str in found_ips:
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+            if start_ip <= ip_obj <= end_ip:
+                used.add(ip_obj)
+        except ValueError:
+            continue
+    return used
+
+
+def get_next_available_ip(start_ip: ipaddress.IPv4Address, end_ip: ipaddress.IPv4Address, used_ips: set[ipaddress.IPv4Address]) -> ipaddress.IPv4Address:
+    """Finds the next unused IP in the pool range, or raises RuntimeError if full."""
+    curr_int = int(start_ip)
+    max_int = int(end_ip)
+
+    while curr_int <= max_int:
+        candidate = ipaddress.IPv4Address(curr_int)
         if candidate not in used_ips:
             return candidate
-        curr += 1
-    return f"{base_prefix}{curr}"
+        curr_int += 1
+
+    raise RuntimeError(f"IP Pool exhausted! No available IPs between {start_ip} and {end_ip}.")
 
 
 def setup_temp_bridge_nat():
@@ -289,25 +317,38 @@ def main():
     print("=" * 60)
     print(f"Interface:       {VLAN_INTERFACE}")
     print(f"Mikrotik Router: {ROUTER_HOST}")
+    print(f"IP Pool:         {IP_POOL_NAME}")
     print(f"Target Password: {CAMERA_PASSWORD}")
     print("=" * 60)
+
+    try:
+        pool_start, pool_end = get_pool_range(IP_POOL_NAME)
+        print(f"[+] Pool range: {pool_start} -> {pool_end}")
+    except Exception as e:
+        print(f"[!] Failed to resolve pool range: {e}")
+        sys.exit(1)
 
     cams = scan_unconfigured_cameras(VLAN_INTERFACE)
 
     if not cams:
         print("[-] No unconfigured cameras found on 192.168.1.64.")
-        print("    Ensure the camera is powered on and connected to VLAN 400.")
+        print(f"    Ensure the camera is powered on and connected to {VLAN_INTERFACE}.")
         sys.exit(0)
 
     print(f"\n[+] Found {len(cams)} unconfigured camera(s):")
     plan = []
-    next_ip = IP_START_STR
+    used_ips = get_used_ips_from_leases(pool_start, pool_end)
 
     for idx, mac in enumerate(cams, 1):
-        assigned_ip = get_next_available_ip(next_ip)
-        next_ip = assigned_ip
-        plan.append((mac, assigned_ip))
-        print(f"  {idx}. MAC: {mac.upper()}  -->  Assigned IP: {assigned_ip}")
+        try:
+            assigned_ip = get_next_available_ip(pool_start, pool_end, used_ips)
+            used_ips.add(assigned_ip)
+            plan.append((mac, str(assigned_ip)))
+            print(f"  {idx}. MAC: {mac.upper()}  -->  Assigned IP: {assigned_ip}")
+        except RuntimeError as e:
+            print(f"  {idx}. MAC: {mac.upper()}  -->  [ERROR] {e}")
+            print("[!] Not enough IPs in pool to provision all discovered cameras.")
+            sys.exit(1)
 
     print("\n" + "-" * 60)
     try:

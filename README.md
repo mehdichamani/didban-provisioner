@@ -44,7 +44,7 @@ An automated CLI tool to discover, activate, reserve DHCP leases on Mikrotik Rou
    - `ROUTER_USER`: SSH username for Mikrotik (leave empty if configured in `~/.ssh/config`).
    - `DHCP_SERVER_NAME`: Mikrotik DHCP server name for camera reservations (e.g. `dhcp1`).
    - `CAMERA_PASSWORD`: New admin password to assign to the cameras upon activation.
-   - `IP_POOL_START`: Starting IP for auto-assigning static DHCP reservations.
+   - `IP_POOL_NAME`: Name of the IP pool configured on Mikrotik (ranges and next available IPs are detected dynamically).
 
 3. **Install Dependencies:**
    Install dependencies and setup the virtual environment via `uv`:
