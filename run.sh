@@ -13,11 +13,10 @@ if [ ! -x "$UV_BIN" ]; then
     exit 1
 fi
 
-# Ensure .venv exists
+# Ensure .venv exists and sync dependencies
 if [ ! -d ".venv" ]; then
-    echo "[*] Initializing virtualenv using uv..."
-    "$UV_BIN" venv .venv
-    "$UV_BIN" pip install --python .venv/bin/python scapy pycryptodome cryptography
+    echo "[*] Syncing dependencies using uv..."
+    "$UV_BIN" sync
 fi
 
 # Execute main.py inside virtualenv with sudo (needed for L2 Scapy raw packets)

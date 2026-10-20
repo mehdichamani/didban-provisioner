@@ -47,9 +47,9 @@ An automated CLI tool to discover, activate, reserve DHCP leases on Mikrotik Rou
    - `IP_POOL_START`: Starting IP for auto-assigning static DHCP reservations.
 
 3. **Install Dependencies:**
-   If using the included launcher script, dependencies are installed automatically via `uv`. Alternatively:
+   Install dependencies and setup the virtual environment via `uv`:
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 ---

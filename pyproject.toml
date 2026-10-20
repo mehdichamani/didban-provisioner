@@ -1,0 +1,14 @@
+[project]
+name = "hik-provisioner"
+version = "0.1.0"
+description = "Automated Hikvision camera batch provisioner for Linux via ISAPI and Mikrotik DHCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cryptography>=42.0.0",
+    "pycryptodome>=3.20.0",
+    "scapy>=2.5.0",
+]
+
+[tool.uv]
+package = false
