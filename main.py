@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Hikvision Interactive Batch Provisioner for Linux
-Discovers unactivated cameras (192.168.1.64) via L2 ARP / SADP,
-reserves DHCP IP on Mikrotik, activates via RSA/AES ISAPI handshake,
-and sets addressing to DHCP.
+Didban Provisioner: Hikvision Batch Provisioner & NVR Onboarding for Linux
+Discovers unactivated cameras (192.168.1.64) via L2 ARP, reserves DHCP IP
+on Mikrotik, activates via RSA/AES ISAPI handshake, and automatically/interactively
+attaches newly provisioned cameras to NVRs discovered from Didban database.
 """
 
 import os
@@ -25,8 +25,11 @@ try:
     from Crypto.Cipher import AES
 except ImportError as e:
     print(f"Error: Missing dependency ({e}).")
-    print("Please run: sudo pacman -S python-scapy python-pycryptodome")
+    print("Please install dependencies: uv sync")
     sys.exit(1)
+
+# Import Didban Bridge
+import didban_bridge as db_bridge
 
 
 def load_env(env_path: Path):
@@ -49,17 +52,16 @@ ENV_FILE = BASE_DIR / ".env"
 CFG = load_env(ENV_FILE)
 
 VLAN_INTERFACE = CFG.get("VLAN_INTERFACE", "eno1.400")
-ROUTER_HOST = CFG.get("ROUTER_HOST", "router.local")
+ROUTER_HOST = CFG.get("ROUTER_HOST", "router-pishgaman")
 ROUTER_USER = CFG.get("ROUTER_USER", "")
-DHCP_SERVER = CFG.get("DHCP_SERVER_NAME", "dhcp1")
-CAMERA_PASSWORD = CFG.get("CAMERA_PASSWORD", "ChangeMe123!")
-IP_POOL_NAME = CFG.get("IP_POOL_NAME", "")
+DHCP_SERVER = CFG.get("DHCP_SERVER_NAME", "server1")
+CAMERA_PASSWORD = CFG.get("CAMERA_PASSWORD", "@Aa3603912!")
+IP_POOL_NAME = CFG.get("IP_POOL_NAME", "pool-cameras")
 
 
 def run_router_cmd(command: str) -> str:
     """Executes a command on the Mikrotik router via SSH."""
     ssh_target = f"{ROUTER_USER}@{ROUTER_HOST}" if ROUTER_USER else ROUTER_HOST
-    # If invoked via sudo, detect the original invoking user to preserve SSH key access
     orig_user = os.environ.get("SUDO_USER")
     
     ssh_cmd = f'ssh -o BatchMode=yes -o ConnectTimeout=6 {ssh_target} "{command}"'
@@ -107,7 +109,7 @@ def scan_unconfigured_cameras(iface: str):
 def get_pool_range(pool_name: str) -> tuple[ipaddress.IPv4Address, ipaddress.IPv4Address]:
     """Queries Mikrotik for the IP range of the given pool."""
     if not pool_name:
-        raise ValueError("IP_POOL_NAME is not set in .env. Please specify the pool name.")
+        raise ValueError("IP_POOL_NAME is not set. Please specify the pool name.")
 
     print(f"[*] Querying IP pool '{pool_name}' from Mikrotik router...")
     out = run_router_cmd(f'/ip/pool/print detail where name="{pool_name}"')
@@ -132,117 +134,128 @@ def get_used_ips_from_leases(start_ip: ipaddress.IPv4Address, end_ip: ipaddress.
                 used.add(ip_obj)
         except ValueError:
             continue
+
+    # Also add Didban registered IPs to guarantee zero IP collisions
+    didban_ips = db_bridge.get_all_registered_ips()
+    for ip_str in didban_ips:
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+            if start_ip <= ip_obj <= end_ip:
+                used.add(ip_obj)
+        except ValueError:
+            continue
+
     return used
 
 
 def get_next_available_ip(start_ip: ipaddress.IPv4Address, end_ip: ipaddress.IPv4Address, used_ips: set[ipaddress.IPv4Address]) -> ipaddress.IPv4Address:
-    """Finds the next unused IP in the pool range, or raises RuntimeError if full."""
-    curr_int = int(start_ip)
-    max_int = int(end_ip)
-
-    while curr_int <= max_int:
-        candidate = ipaddress.IPv4Address(curr_int)
-        if candidate not in used_ips:
-            return candidate
-        curr_int += 1
-
-    raise RuntimeError(f"IP Pool exhausted! No available IPs between {start_ip} and {end_ip}.")
+    curr = start_ip
+    while curr <= end_ip:
+        if curr not in used_ips:
+            return curr
+        curr += 1
+    raise RuntimeError("No available IP addresses in the pool!")
 
 
 def setup_temp_bridge_nat():
-    """Sets up temporary IP & DNAT on Mikrotik so Linux host can access 192.168.1.64 via port 8080."""
-    print("[*] Setting up temporary routing/NAT on Mikrotik...")
-    cmd = """
-/ip address add address=192.168.1.250/24 interface=bridge comment="Temp-Provision";
-/ip firewall nat add chain=srcnat dst-address=192.168.1.64 action=masquerade comment="Temp-Provision";
-/ip firewall nat add chain=dstnat dst-address=172.20.0.1 protocol=tcp dst-port=8080 action=dst-nat to-addresses=192.168.1.64 to-ports=80 comment="Temp-Provision";
-"""
-    run_router_cmd(cmd)
+    """Sets up temporary NAT on Mikrotik to access 192.168.1.64 via 172.20.0.1:8080."""
+    print("[*] Setting up temporary Mikrotik NAT for 192.168.1.64...")
+    run_router_cmd('/ip firewall nat add chain=dstnat dst-address=172.20.0.1 protocol=tcp dst-port=8080 action=dst-nat to-addresses=192.168.1.64 to-ports=80 comment="TEMP_DIDBAN_PROVISIONER"')
+    run_router_cmd('/ip firewall nat add chain=srcnat dst-address=192.168.1.64 action=masquerade comment="TEMP_DIDBAN_PROVISIONER"')
 
 
 def cleanup_temp_bridge_nat():
-    """Removes temporary NAT rules on Mikrotik."""
-    print("[*] Cleaning up temporary routing/NAT from Mikrotik...")
-    cmd = """
-/ip address remove [find comment="Temp-Provision"];
-/ip firewall nat remove [find comment="Temp-Provision"];
-"""
+    """Removes temporary NAT rules."""
+    print("[*] Cleaning up temporary Mikrotik NAT...")
     try:
-        run_router_cmd(cmd)
+        run_router_cmd('/ip firewall nat remove [find comment="TEMP_DIDBAN_PROVISIONER"]')
     except Exception:
         pass
 
 
 def activate_camera(target_url: str, password: str):
-    """Executes the Hikvision ISAPI RSA/AES activation handshake."""
-    # 1. Generate RSA Key
-    key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
-    pub_numbers = key.public_key().public_numbers()
-    modulus_hex = format(pub_numbers.n, "x")
-    if len(modulus_hex) % 2 != 0:
-        modulus_hex = "0" + modulus_hex
-    pub_key_b64 = base64.b64encode(modulus_hex.encode("utf-8")).decode("utf-8")
+    """Executes Hikvision RSA/AES handshake to activate camera."""
+    sec_cap_url = f"{target_url}/ISAPI/Security/capabilities"
+    req = urllib.request.Request(sec_cap_url)
+    with urllib.request.urlopen(req, timeout=5) as response:
+        content = response.read().decode("utf-8")
 
-    # 2. Request Challenge
-    challenge_xml = f'<PublicKey version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema"><key>{pub_key_b64}</key></PublicKey>'
-    req = urllib.request.Request(
-        f"{target_url}/ISAPI/Security/challenge",
-        data=challenge_xml.encode("utf-8"),
-        headers={"Content-Type": "application/xml"},
-        method="POST"
-    )
+    m_key = re.search(r"<key>([^<]+)</key>", content)
+    m_challenge = re.search(r"<challenge>([^<]+)</challenge>", content)
+    if not m_key or not m_challenge:
+        raise ValueError("Could not extract RSA key or challenge from camera capabilities.")
 
-    with urllib.request.urlopen(req, timeout=6) as resp:
-        body = resp.read().decode("utf-8")
+    raw_key = m_key.group(1).strip()
+    challenge = m_challenge.group(1).strip()
 
-    m = re.search(r"<key>(.*?)</key>", body)
-    if not m:
-        raise ValueError("Invalid challenge response from camera")
+    aes_key = os.urandom(16)
+    cipher_aes = AES.new(aes_key, AES.MODE_ECB)
+    pad_len = 16 - (len(password) % 16)
+    padded_pass = password.encode() + bytes([pad_len]) * pad_len
+    enc_password = base64.b64encode(cipher_aes.encrypt(padded_pass)).decode()
 
-    dev_key_b64 = m.group(1)
-    dev_key_hex = base64.b64decode(dev_key_b64).decode("utf-8")
-    encrypted_bytes = bytes.fromhex(dev_key_hex)
+    clean_pem = "\n".join(raw_key.strip().split("\n")[1:-1])
+    key_bytes = base64.b64decode(clean_pem)
 
-    decrypted_rand = key.decrypt(encrypted_bytes, padding.PKCS1v15()).decode("utf-8")
-    rand_prefix = decrypted_rand[:16]
+    def parse_public_key_rsa(der_data):
+        pos = 0
+        def read_len(p):
+            l = der_data[p]
+            if l < 0x80:
+                return l, p + 1
+            n_bytes = l & 0x7F
+            val = 0
+            p += 1
+            for _ in range(n_bytes):
+                val = (val << 8) | der_data[p]
+                p += 1
+            return val, p
 
-    if len(decrypted_rand) == 64:
-        aes_key = bytes.fromhex(decrypted_rand[32:])
-    else:
-        aes_key = bytes.fromhex(decrypted_rand) if len(decrypted_rand) == 32 and all(c in "0123456789abcdefABCDEF" for c in decrypted_rand) else decrypted_rand[:16].encode("utf-8")
+        assert der_data[pos] == 0x30
+        pos += 1
+        _, pos = read_len(pos)
+        assert der_data[pos] == 0x30
+        pos += 1
+        _, pos = read_len(pos)
+        while der_data[pos] != 0x03:
+            pos += 1
+        pos += 1
+        _, pos = read_len(pos)
+        pos += 1  # unused bits
+        assert der_data[pos] == 0x30
+        pos += 1
+        _, pos = read_len(pos)
+        assert der_data[pos] == 0x02
+        pos += 1
+        mod_len, pos = read_len(pos)
+        modulus = int.from_bytes(der_data[pos:pos+mod_len], 'big')
+        pos += mod_len
+        assert der_data[pos] == 0x02
+        pos += 1
+        exp_len, pos = read_len(pos)
+        exponent = int.from_bytes(der_data[pos:pos+exp_len], 'big')
+        return rsa.RSAPublicNumbers(exponent, modulus).public_key()
 
-    # Prepare payload: 16-byte random prefix + password (padded to 16-byte block with nulls)
-    pwd_bytes = password.encode("utf-8")
-    if len(pwd_bytes) < 16:
-        pwd_bytes = pwd_bytes + b"\x00" * (16 - len(pwd_bytes))
-    elif len(pwd_bytes) % 16 != 0:
-        pwd_bytes = pwd_bytes + b"\x00" * (16 - (len(pwd_bytes) % 16))
+    pub_key = parse_public_key_rsa(key_bytes)
+    data_to_rsa = (challenge + ":" + base64.b64encode(aes_key).decode()).encode()
+    enc_key = base64.b64encode(pub_key.encrypt(data_to_rsa, padding.PKCS1v15())).decode()
 
-    payload = rand_prefix.encode("utf-8") + pwd_bytes
+    activate_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ActivateInfo version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <password>{enc_password}</password>
+    <key>{enc_key}</key>
+</ActivateInfo>"""
 
-    # AES-128 in ECB mode
-    cipher = AES.new(aes_key, AES.MODE_ECB)
-    enc = cipher.encrypt(payload)
-
-    enc_hex = enc.hex()
-    enc_b64 = base64.b64encode(enc_hex.encode("utf-8")).decode("utf-8")
-
-    # 3. Send ActivateInfo
-    activate_xml = f'<?xml version="1.0" encoding="UTF-8"?><ActivateInfo version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema"><password>{enc_b64}</password></ActivateInfo>'
-    req_act = urllib.request.Request(
-        f"{target_url}/ISAPI/System/activate",
-        data=activate_xml.encode("utf-8"),
-        headers={"Content-Type": "application/xml"},
-        method="PUT"
-    )
-
-    with urllib.request.urlopen(req_act, timeout=6) as resp:
-        return resp.read().decode("utf-8")
+    act_url = f"{target_url}/ISAPI/System/activate"
+    req = urllib.request.Request(act_url, data=activate_xml.encode("utf-8"), headers={"Content-Type": "application/xml"}, method="PUT")
+    with urllib.request.urlopen(req, timeout=5) as response:
+        resp = response.read().decode("utf-8")
+        if "<statusCode>1</statusCode>" not in resp and "OK" not in resp:
+            raise RuntimeError(f"Activation failed: {resp}")
 
 
 def set_dhcp_and_reboot(target_url: str, password: str):
-    """Enables DHCP and reboots the camera via Digest-authenticated curl."""
-    # Use curl for reliable digest authentication
+    """Configures DHCP and initiates a reboot via curl."""
     dhcp_xml = '<?xml version="1.0" encoding="UTF-8"?><IPAddress version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema"><ipVersion>dual</ipVersion><addressingType>dynamic</addressingType></IPAddress>'
     cmd_dhcp = [
         "curl", "-s", "--digest", "-u", f"admin:{password}",
@@ -252,7 +265,6 @@ def set_dhcp_and_reboot(target_url: str, password: str):
     ]
     subprocess.run(cmd_dhcp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
-    # Reboot command
     cmd_reboot = [
         "curl", "-s", "--digest", "-u", f"admin:{password}",
         "-X", "PUT",
@@ -261,34 +273,29 @@ def set_dhcp_and_reboot(target_url: str, password: str):
     subprocess.run(cmd_reboot, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
 
 
-def provision_single_camera(mac: str, target_ip: str, password: str):
-    """Orchestrates provisioning for one camera."""
+def provision_single_camera(mac: str, target_ip: str, password: str) -> bool:
+    """Orchestrates L2 provisioning & DHCP allocation for one camera."""
     mac_upper = mac.upper()
     comment = f"Hikvision Camera - {target_ip.split('.')[-1]}"
 
-    # Step 1: Add reservation in Mikrotik
     print(f"\n[+] Step 1: Reserving {target_ip} for {mac_upper} in Mikrotik...")
     cmd_lease = f'/ip dhcp-server lease add address={target_ip} mac-address={mac_upper} server={DHCP_SERVER} comment="{comment}"'
     run_router_cmd(cmd_lease)
 
-    # Step 2: Temporary NAT
     setup_temp_bridge_nat()
     time.sleep(1.5)
 
     target_url = "http://172.20.0.1:8080"
     try:
-        # Step 3: Activate
         print(f"[+] Step 2: Activating camera via ISAPI handshake with password...")
         activate_camera(target_url, password)
         print("    [OK] Camera successfully activated!")
 
-        # Step 4: Set DHCP and Reboot
         print("[+] Step 3: Enabling DHCP and sending reboot command...")
         set_dhcp_and_reboot(target_url, password)
         print("    [OK] DHCP enabled and reboot initiated.")
 
     finally:
-        # Step 5: Always cleanup NAT
         cleanup_temp_bridge_nat()
 
     print(f"[+] Waiting for camera {mac_upper} to obtain {target_ip} from DHCP...")
@@ -306,19 +313,116 @@ def provision_single_camera(mac: str, target_ip: str, password: str):
     return False
 
 
+def handle_nvr_attachment(camera_ip: str, camera_password: str):
+    """
+    Presents available NVRs from Didban, calculates free channels,
+    and attaches the camera directly to the selected NVR.
+    """
+    nvrs = db_bridge.get_nvrs_from_didban()
+    if not nvrs:
+        print("[-] No NVRs found in Didban database. Skipping NVR attachment.")
+        return
+
+    print("\n" + "=" * 60)
+    print("   NVR Attachment (from Didban Database)")
+    print("=" * 60)
+
+    # Inspect NVR capacity
+    nvr_choices = []
+    for idx, n in enumerate(nvrs, 1):
+        channels = db_bridge.get_nvr_channels_info(n["ip"], n["user"], n["password"])
+        next_free = db_bridge.find_next_free_channel(set(channels.keys()))
+        free_count = 32 - len(channels)
+        nvr_choices.append({
+            "nvr": n,
+            "next_free": next_free,
+            "occupied_count": len(channels),
+            "free_count": free_count
+        })
+        status_str = f"Next free CH: {next_free} ({free_count} free slots)" if next_free else "[FULL]"
+        print(f"  {idx}. {n['name']} ({n['ip']}) - {status_str}")
+
+    print("  0. Skip NVR attachment")
+
+    try:
+        sel = input(f"\nSelect target NVR [0-{len(nvrs)}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if not sel or sel == "0":
+        print("[*] NVR attachment skipped.")
+        return
+
+    try:
+        chosen_idx = int(sel) - 1
+        if chosen_idx < 0 or chosen_idx >= len(nvr_choices):
+            print("[!] Invalid selection.")
+            return
+    except ValueError:
+        print("[!] Invalid selection.")
+        return
+
+    chosen = nvr_choices[chosen_idx]
+    if not chosen["next_free"]:
+        print(f"[!] Target NVR {chosen['nvr']['name']} has no free channels!")
+        return
+
+    nvr = chosen["nvr"]
+    target_ch = chosen["next_free"]
+
+    # Optional camera name
+    default_name = f"Camera {target_ch:02d}"
+    try:
+        custom_name = input(f"Enter camera name [default: {default_name}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        custom_name = default_name
+
+    final_name = custom_name if custom_name else default_name
+
+    print(f"\n[*] Attaching camera {camera_ip} to {nvr['name']} ({nvr['ip']}) on Channel {target_ch}...")
+    success, msg = db_bridge.add_camera_to_nvr(
+        nvr_ip=nvr["ip"],
+        nvr_user=nvr["user"],
+        nvr_password=nvr["password"],
+        channel_id=target_ch,
+        camera_name=final_name,
+        camera_ip=camera_ip,
+        camera_password=camera_password
+    )
+
+    if not success:
+        print(f"[!] Failed to attach camera to NVR: {msg}")
+        return
+
+    print("    [OK] Configuration sent to NVR. Verifying connection status...")
+    for attempt in range(6):
+        time.sleep(3)
+        online, det_status = db_bridge.verify_camera_connection_status(
+            nvr["ip"], nvr["user"], nvr["password"], target_ch
+        )
+        if online:
+            print(f"🎉 SUCCESS! Camera is ONLINE on {nvr['name']} (Channel {target_ch})!")
+            return
+        sys.stdout.write(f".({det_status})")
+        sys.stdout.flush()
+
+    print(f"\n[!] Camera added to NVR CH {target_ch}, but connection not confirmed yet (Status: {det_status}).")
+
+
 def main():
     if os.geteuid() != 0:
         print("[!] This script requires root privileges for Layer 2 raw packet sniffing.")
-        print("    Please run with: sudo ./provision.py")
+        print("    Please run with: sudo ./start.sh or sudo python3 main.py")
         sys.exit(1)
 
     print("=" * 60)
-    print("   Hikvision Interactive Batch Provisioner (Linux)")
+    print("   Didban Provisioner: Hikvision Auto-Provision & NVR Onboarding")
     print("=" * 60)
     print(f"Interface:       {VLAN_INTERFACE}")
     print(f"Mikrotik Router: {ROUTER_HOST}")
     print(f"IP Pool:         {IP_POOL_NAME}")
-    print(f"Target Password: {CAMERA_PASSWORD}")
+    print(f"Camera Password: {CAMERA_PASSWORD}")
+    print(f"Didban Database: {'Connected (data/monitor.db)' if db_bridge.is_didban_available() else 'Not found'}")
     print("=" * 60)
 
     try:
@@ -333,6 +437,16 @@ def main():
     if not cams:
         print("[-] No unconfigured cameras found on 192.168.1.64.")
         print(f"    Ensure the camera is powered on and connected to {VLAN_INTERFACE}.")
+        
+        # Even if no unactivated camera found, allow attaching an already active IP directly:
+        try:
+            direct_ans = input("\nDo you want to attach an already active camera IP to an NVR? [y/N]: ").strip().lower()
+            if direct_ans in ("y", "yes"):
+                active_ip = input("Enter active camera IP: ").strip()
+                if active_ip:
+                    handle_nvr_attachment(active_ip, CAMERA_PASSWORD)
+        except (EOFError, KeyboardInterrupt):
+            pass
         sys.exit(0)
 
     print(f"\n[+] Found {len(cams)} unconfigured camera(s):")
@@ -362,9 +476,11 @@ def main():
 
     for mac, ip in plan:
         print(f"\n{'='*20} Provisioning {mac.upper()} {'='*20}")
-        provision_single_camera(mac, ip, CAMERA_PASSWORD)
+        success = provision_single_camera(mac, ip, CAMERA_PASSWORD)
+        if success:
+            handle_nvr_attachment(ip, CAMERA_PASSWORD)
 
-    print("\n[+] All provisioning tasks completed!")
+    print("\n[+] All tasks completed successfully!")
 
 
 if __name__ == "__main__":
