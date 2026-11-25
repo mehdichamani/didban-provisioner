@@ -421,7 +421,12 @@ def main():
     print(f"Interface:       {VLAN_INTERFACE}")
     print(f"Mikrotik Router: {ROUTER_HOST}")
     print(f"IP Pool:         {IP_POOL_NAME}")
-    print(f"Camera Password: {CAMERA_PASSWORD}")
+    masked_password = (
+        CAMERA_PASSWORD[:3] + "*" * (len(CAMERA_PASSWORD) - 3)
+        if len(CAMERA_PASSWORD) > 3
+        else "***"
+    )
+    print(f"Camera Password: {masked_password}")
     print(f"Didban Database: {'Connected (data/monitor.db)' if db_bridge.is_didban_available() else 'Not found'}")
     print("=" * 60)
 
